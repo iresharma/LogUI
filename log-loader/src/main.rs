@@ -3,11 +3,10 @@
 //! Optional CLI: --level-key=K --message-key=K --timestamp-key=K. If omitted, keys are inferred.
 
 use serde_json::{Map, Value};
-use std::collections::HashMap;
 use std::env;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, Write, BufWriter};
 use std::process::exit;
-use std::{fs::File, path::Path};
+use std::{fs, path::Path};
 
 const LEVEL_CANDIDATES: &[&str] = &["level", "log_level", "severity", "level_name", "lvl"];
 const MESSAGE_CANDIDATES: &[&str] = &["message", "msg", "error", "error_message", "text", "summary", "body"];
@@ -27,12 +26,12 @@ fn parse_args(args: &[String]) -> Option<Config> {
     let mut message_key = None;
     let mut timestamp_key = None;
     for arg in args.iter().skip(1) {
-        if arg.starts_with("--level-key=") {
-            level_key = Some(arg.trim_start_matches("--level-key=").to_string());
-        } else if arg.starts_with("--message-key=") {
-            message_key = Some(arg.trim_start_matches("--message-key=").to_string());
-        } else if arg.starts_with("--timestamp-key=") {
-            timestamp_key = Some(arg.trim_start_matches("--timestamp-key=").to_string());
+        if let Some(v) = arg.strip_prefix("--level-key=") {
+            level_key = Some(v.to_string());
+        } else if let Some(v) = arg.strip_prefix("--message-key=") {
+            message_key = Some(v.to_string());
+        } else if let Some(v) = arg.strip_prefix("--timestamp-key=") {
+            timestamp_key = Some(v.to_string());
         } else if !arg.starts_with('-') {
             path = Some(arg.clone());
         }
@@ -61,142 +60,295 @@ fn main() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Core
+// ---------------------------------------------------------------------------
+
+/// A parsed line holding a borrowed reference to the raw text and the parsed JSON.
+struct Parsed<'a> {
+    raw: &'a str,
+    entry: Value,
+}
+
 fn run(config: &Config) -> io::Result<()> {
     let path = Path::new(&config.path);
     if !path.exists() {
         return Ok(());
     }
 
-    let f = File::open(path)?;
-    let reader = BufReader::new(f);
-    let lines: Vec<String> = reader
-        .lines()
-        .filter_map(|l| l.ok())
-        .map(|s| s.trim_end_matches(|c| c == '\n' || c == '\r').to_string())
+    // ── Read the entire file in one syscall ──────────────────────────────
+    let content = fs::read_to_string(path)?;
+
+    // ── Collect line slices (zero allocation per line) ───────────────────
+    // We reference directly into `content`.
+    let line_refs: Vec<&str> = content
+        .split('\n')
+        .map(|l| l.strip_suffix('\r').unwrap_or(l))
         .collect();
 
-    let parsed: Vec<(String, Value)> = lines
-        .iter()
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| {
-            let trimmed = s.trim();
-            (s.clone(), parse_line(trimmed))
-        })
-        .collect();
+    // ── Single pass: parse + count key candidates ───────────────────────
+    // Use fixed-size arrays instead of HashMap for cache-friendly counting.
+    let mut level_counts  = [0u32; 5];  // matches LEVEL_CANDIDATES.len()
+    let mut msg_counts    = [0u32; 7];  // matches MESSAGE_CANDIDATES.len()
+    let mut ts_counts     = [0u32; 7];  // matches TIMESTAMP_CANDIDATES.len()
 
-    let valid_entries: Vec<&Value> = parsed
-        .iter()
-        .filter(|(_, v)| !is_parse_error(v))
-        .map(|(_, v)| v)
-        .collect();
+    let mut parsed: Vec<Parsed> = Vec::with_capacity(line_refs.len());
 
-    let level_key = config
-        .level_key
-        .clone()
-        .or_else(|| best_key(LEVEL_CANDIDATES, &valid_entries));
-    let message_key = config
-        .message_key
-        .clone()
-        .or_else(|| best_key(MESSAGE_CANDIDATES, &valid_entries));
-    let timestamp_key = config
-        .timestamp_key
-        .clone()
-        .or_else(|| best_key(TIMESTAMP_CANDIDATES, &valid_entries));
+    for &raw in &line_refs {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let entry = parse_line(trimmed);
 
+        if let Some(obj) = entry.as_object() {
+            if !obj.contains_key("_parse_error") {
+                for (i, &k) in LEVEL_CANDIDATES.iter().enumerate() {
+                    if obj.contains_key(k) { level_counts[i] += 1; }
+                }
+                for (i, &k) in MESSAGE_CANDIDATES.iter().enumerate() {
+                    if obj.contains_key(k) { msg_counts[i] += 1; }
+                }
+                for (i, &k) in TIMESTAMP_CANDIDATES.iter().enumerate() {
+                    if obj.contains_key(k) { ts_counts[i] += 1; }
+                }
+            }
+        }
+
+        parsed.push(Parsed { raw, entry });
+    }
+
+    // ── Infer keys ──────────────────────────────────────────────────────
+    let level_key = config.level_key.clone()
+        .or_else(|| pick_best(LEVEL_CANDIDATES, &level_counts));
+    let message_key = config.message_key.clone()
+        .or_else(|| pick_best(MESSAGE_CANDIDATES, &msg_counts));
+    let timestamp_key = config.timestamp_key.clone()
+        .or_else(|| pick_best(TIMESTAMP_CANDIDATES, &ts_counts));
+
+    let lk = level_key.as_deref();
+    let mk = message_key.as_deref();
+    let tk = timestamp_key.as_deref();
+
+    // ── Output ──────────────────────────────────────────────────────────
     let stdout = io::stdout();
-    let mut out = stdout.lock();
+    let mut out = BufWriter::with_capacity(256 * 1024, stdout.lock());
 
-    for (raw, entry) in &parsed {
-        let (level, message, timestamp) = if is_parse_error(entry) {
-            (String::new(), String::new(), String::new())
+    // Reusable scratch buffers — never freed, just cleared each iteration.
+    let mut level_buf = String::with_capacity(64);
+    let mut msg_buf   = String::with_capacity(256);
+    let mut ts_buf    = String::with_capacity(128);
+    // Line buffer: we build the full JSON row here, then flush once.
+    let mut row_buf: Vec<u8> = Vec::with_capacity(8192);
+
+    for pl in &parsed {
+        let is_err = is_parse_error(&pl.entry);
+
+        if is_err {
+            level_buf.clear();
+            msg_buf.clear();
+            ts_buf.clear();
         } else {
-            let obj = entry.as_object().unwrap();
-            (
-                extract_string(obj, level_key.as_deref(), 12),
-                extract_message(obj, message_key.as_deref()),
-                extract_string(obj, timestamp_key.as_deref(), 80),
-            )
-        };
-        let row = serde_json::json!({
-            "level": level,
-            "message": message,
-            "timestamp": timestamp,
-            "the_json": entry,
-            "raw": raw
-        });
-        serde_json::to_writer(&mut out, &row)?;
-        out.write_all(b"\n")?;
+            let obj = pl.entry.as_object().unwrap();
+            extract_string_into(&mut level_buf, obj, lk, 12);
+            extract_message_into(&mut msg_buf, obj, mk);
+            extract_string_into(&mut ts_buf, obj, tk, 80);
+        }
+
+        // Build the entire row in `row_buf`, then do a single write_all.
+        row_buf.clear();
+        row_buf.extend_from_slice(b"{\"level\":");
+        write_json_str(&mut row_buf, &level_buf);
+        row_buf.extend_from_slice(b",\"message\":");
+        write_json_str(&mut row_buf, &msg_buf);
+        row_buf.extend_from_slice(b",\"timestamp\":");
+        write_json_str(&mut row_buf, &ts_buf);
+        row_buf.extend_from_slice(b",\"the_json\":");
+        // serde_json::to_writer into Vec<u8> is just a memcpy – no syscalls.
+        serde_json::to_writer(&mut row_buf, &pl.entry)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        row_buf.extend_from_slice(b",\"raw\":");
+        write_json_str(&mut row_buf, pl.raw);
+        row_buf.push(b'}');
+        row_buf.push(b'\n');
+
+        out.write_all(&row_buf)?;
     }
     out.flush()?;
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Fast JSON string escaping (replaces serde_json::to_writer for &str)
+// ---------------------------------------------------------------------------
+
+/// Write a JSON-encoded string (with quotes) into `buf`.
+/// Fast path: scan for bytes that need escaping; memcpy everything in between.
+#[inline]
+fn write_json_str(buf: &mut Vec<u8>, s: &str) {
+    buf.push(b'"');
+    let bytes = s.as_bytes();
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        // Check if this byte needs escaping.
+        let esc: &[u8] = match b {
+            b'"'  => b"\\\"",
+            b'\\' => b"\\\\",
+            b'\n' => b"\\n",
+            b'\r' => b"\\r",
+            b'\t' => b"\\t",
+            0x08  => b"\\b",
+            0x0C  => b"\\f",
+            0x00..=0x1F => {
+                // Flush unescaped segment.
+                buf.extend_from_slice(&bytes[start..i]);
+                // \u00XX escape for other control chars.
+                let hi = HEX_TABLE[(b >> 4) as usize];
+                let lo = HEX_TABLE[(b & 0x0F) as usize];
+                buf.extend_from_slice(&[b'\\', b'u', b'0', b'0', hi, lo]);
+                i += 1;
+                start = i;
+                continue;
+            }
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        // Flush the clean segment before this byte, then write escape.
+        buf.extend_from_slice(&bytes[start..i]);
+        buf.extend_from_slice(esc);
+        i += 1;
+        start = i;
+    }
+    // Flush remaining clean segment.
+    buf.extend_from_slice(&bytes[start..]);
+    buf.push(b'"');
+}
+
+const HEX_TABLE: &[u8; 16] = b"0123456789abcdef";
+
+// ---------------------------------------------------------------------------
+// Key inference
+// ---------------------------------------------------------------------------
+
+fn pick_best(candidates: &[&str], counts: &[u32]) -> Option<String> {
+    candidates
+        .iter()
+        .enumerate()
+        .filter(|&(i, _)| counts[i] > 0)
+        .min_by_key(|&(i, k)| (std::cmp::Reverse(counts[i]), *k))
+        .map(|(_, s)| (*s).to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Field extraction (reuses caller-owned String buffers)
+// ---------------------------------------------------------------------------
+
+#[inline]
 fn is_parse_error(v: &Value) -> bool {
     v.get("_parse_error").and_then(Value::as_bool).unwrap_or(false)
 }
 
-fn best_key(candidates: &[&str], valid: &[&Value]) -> Option<String> {
-    let mut counts: HashMap<&str, u32> = HashMap::new();
-    for key in candidates {
-        counts.insert(*key, 0);
-    }
-    for obj in valid.iter().filter_map(|v| v.as_object()) {
-        for key in candidates {
-            if obj.contains_key(*key) {
-                *counts.get_mut(key).unwrap() += 1;
-            }
-        }
-    }
-    candidates
-        .iter()
-        .filter(|k| counts.get(*k).copied().unwrap_or(0) > 0)
-        .min_by_key(|k| {
-            let c = counts.get(*k).copied().unwrap_or(0);
-            (std::cmp::Reverse(c), *k)
-        })
-        .map(|s| (*s).to_string())
-}
-
-fn value_to_string(v: &Value) -> String {
-    match v {
-        Value::Null => String::new(),
-        Value::Bool(b) => b.to_string(),
-        Value::Number(n) => n.to_string(),
-        Value::String(s) => s.clone(),
-        Value::Array(_) => "[array]".to_string(),
-        Value::Object(_) => "[object]".to_string(),
-    }
-}
-
-fn extract_string(obj: &Map<String, Value>, key: Option<&str>, max_len: usize) -> String {
+fn extract_string_into(
+    buf: &mut String,
+    obj: &Map<String, Value>,
+    key: Option<&str>,
+    max_len: usize,
+) {
+    buf.clear();
     let key = match key {
         Some(k) if obj.contains_key(k) => k,
-        _ => return String::new(),
+        _ => return,
     };
-    let s = value_to_string(&obj[key]);
-    let s = s.trim();
-    if s.len() <= max_len {
-        s.to_string()
-    } else {
-        format!("{}...", s[..max_len.saturating_sub(3)].trim_end())
+    append_value_str(buf, &obj[key]);
+    trim_in_place(buf);
+    truncate_with_ellipsis(buf, max_len);
+}
+
+fn extract_message_into(
+    buf: &mut String,
+    obj: &Map<String, Value>,
+    message_key: Option<&str>,
+) {
+    buf.clear();
+    if let Some(k) = message_key {
+        if let Some(v) = obj.get(k) {
+            append_value_str(buf, v);
+            trim_in_place(buf);
+        }
+    }
+    if buf.is_empty() {
+        if let Some(v) = obj.get("error") {
+            append_value_str(buf, v);
+            trim_in_place(buf);
+        }
+    }
+    truncate_with_ellipsis(buf, MESSAGE_TRUNCATE);
+}
+
+/// Append JSON value as display string into `buf` without allocating.
+#[inline]
+fn append_value_str(buf: &mut String, v: &Value) {
+    match v {
+        Value::Null => {}
+        Value::Bool(true)  => buf.push_str("true"),
+        Value::Bool(false) => buf.push_str("false"),
+        Value::Number(n) => {
+            use std::fmt::Write;
+            let _ = write!(buf, "{}", n);
+        }
+        Value::String(s) => buf.push_str(s),
+        Value::Array(_)  => buf.push_str("[array]"),
+        Value::Object(_) => buf.push_str("[object]"),
     }
 }
 
-fn extract_message(obj: &Map<String, Value>, message_key: Option<&str>) -> String {
-    let mut s = String::new();
-    if let Some(k) = message_key {
-        if obj.contains_key(k) {
-            s = value_to_string(&obj[k]).trim().to_string();
-        }
+/// Trim leading + trailing whitespace in-place without reallocating.
+#[inline]
+fn trim_in_place(buf: &mut String) {
+    let lead = buf.len() - buf.trim_start().len();
+    if lead > 0 {
+        buf.drain(..lead);
     }
-    if s.is_empty() && obj.contains_key("error") {
-        s = value_to_string(&obj["error"]).trim().to_string();
-    }
-    if s.len() > MESSAGE_TRUNCATE {
-        s = format!("{}...", s[..MESSAGE_TRUNCATE.saturating_sub(3)].trim_end());
-    }
-    s
+    let trail = buf.trim_end().len();
+    buf.truncate(trail);
 }
+
+/// If `buf` exceeds `max`, truncate to `max-3` (char-safe) and append "...".
+#[inline]
+fn truncate_with_ellipsis(buf: &mut String, max: usize) {
+    if buf.len() <= max {
+        return;
+    }
+    let target = max.saturating_sub(3);
+    let end = floor_char_boundary(buf, target);
+    buf.truncate(end);
+    // Trim any trailing whitespace from the truncated part.
+    let t = buf.trim_end().len();
+    buf.truncate(t);
+    buf.push_str("...");
+}
+
+/// Largest byte index ≤ `i` that is a valid UTF-8 char boundary.
+#[inline]
+fn floor_char_boundary(s: &str, i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    let b = s.as_bytes();
+    let mut pos = i;
+    while pos > 0 && (b[pos] & 0xC0) == 0x80 {
+        pos -= 1;
+    }
+    pos
+}
+
+// ---------------------------------------------------------------------------
+// JSON line parser
+// ---------------------------------------------------------------------------
 
 fn parse_line(line: &str) -> Value {
     let trimmed = line.trim();

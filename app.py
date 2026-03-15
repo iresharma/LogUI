@@ -18,7 +18,7 @@ from textual.widgets import Collapsible, Footer, Static, Tree
 
 from themes import LOGUI_DARK, LOGUI_LIGHT
 
-from log_loader import load_log_file
+from log_loader import load_log_file, load_used_rust
 from schema import all_keys_from_entries, schema_from_object
 from screens.filter_screen import FilterScreen
 from screens.log_settings_screen import LogSettingsScreen
@@ -110,6 +110,8 @@ class LogUI(App[None]):
             self.theme = "logui-dark"
         if self.log_path and self.log_path.exists():
             self.log_entries, self.raw_lines = load_log_file(self.log_path)
+            if load_used_rust():
+                self.notify("Logs loaded with Rust loader", severity="information")
             self._filtered_indices = list(range(len(self.log_entries)))
             keys = all_keys_from_entries(self.log_entries)
             if keys and self.display_key not in keys:

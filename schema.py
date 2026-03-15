@@ -69,3 +69,36 @@ def all_keys_from_entries(entries: list[dict[str, Any]]) -> list[str]:
                 if not k.startswith("_"):
                     keys_set.add(k)
     return sorted(keys_set)
+
+
+# Candidate keys for inferring level, message, timestamp (order = preference when tied).
+LEVEL_CANDIDATES = ("level", "log_level", "severity", "level_name", "lvl")
+MESSAGE_CANDIDATES = ("message", "msg", "error", "error_message", "text", "summary", "body")
+TIMESTAMP_CANDIDATES = ("timestamp", "time", "ts", "@timestamp", "created_at", "date", "datetime")
+
+
+def infer_display_keys(entries: list[dict[str, Any]]) -> tuple[str | None, str | None, str | None]:
+    """Infer (level_key, message_key, timestamp_key) from entries using most common keys.
+
+    Counts how many entries have each candidate key and returns the key with
+    the highest count per category. Returns None for a category if no candidate appears.
+    """
+    valid = [e for e in entries if isinstance(e, dict) and not e.get("_parse_error")]
+    if not valid:
+        return None, None, None
+
+    def best_key(candidates: tuple[str, ...]) -> str | None:
+        counts: list[tuple[int, str]] = []
+        for key in candidates:
+            count = sum(1 for e in valid if key in e)
+            if count > 0:
+                counts.append((count, key))
+        if not counts:
+            return None
+        counts.sort(key=lambda x: (-x[0], x[1]))
+        return counts[0][1]
+
+    level_key = best_key(LEVEL_CANDIDATES)
+    message_key = best_key(MESSAGE_CANDIDATES)
+    timestamp_key = best_key(TIMESTAMP_CANDIDATES)
+    return level_key, message_key, timestamp_key

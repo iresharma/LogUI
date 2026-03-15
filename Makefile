@@ -1,5 +1,5 @@
 PYTHON ?= python
-LOG_FILE ?= example_logs.txt
+LOG_FILE ?= example_logs_large.txt
 
 RUST_DIR := log-loader
 RUST_BIN := $(RUST_DIR)/target/release/log-loader

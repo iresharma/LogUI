@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -15,12 +16,14 @@ from textual.css.query import NoMatches
 from textual.events import DescendantFocus
 from textual.widget import Widget
 from textual.widgets import Collapsible, Footer, Static, Tree
+from textual.worker import Worker
 
 from themes import LOGUI_DARK, LOGUI_LIGHT
 
 from log_loader import load_log_file, load_used_rust
-from schema import all_keys_from_entries, schema_from_object
+from schema import all_keys_from_entries, infer_display_keys, schema_from_object
 from screens.filter_screen import FilterScreen
+from screens.loading_screen import LoadingScreen
 from screens.log_settings_screen import LogSettingsScreen
 from widgets.log_container import LogContainer
 from widgets.log_ui_header import LogUIHeader
@@ -28,21 +31,16 @@ from widgets.log_ui_header import LogUIHeader
 
 VERSION = "v0.0.1"
 
-LEVEL_KEYS = ("level", "log_level", "severity")
 LEVEL_STYLES = {"info": "dim", "warn": "yellow", "warning": "yellow", "error": "red", "debug": "dim cyan"}
 
 
-def _level_badge(entry: dict[str, Any]) -> str:
-    """Return a Rich/markup string for the log level badge, or empty if not found."""
-    level = None
-    for k in LEVEL_KEYS:
-        if k in entry and isinstance(entry[k], str):
-            level = (entry[k] or "").strip().lower()
-            break
+def _level_badge_from_level(level: str) -> str:
+    """Return a Rich/markup string for the log level badge from normalized level string."""
     if not level:
         return ""
-    style = LEVEL_STYLES.get(level, "dim")
-    return f"[{style}][ {level.upper()} ][/{style}]"
+    lvl = level.strip().lower()
+    style = LEVEL_STYLES.get(lvl, "dim")
+    return f"[{style}][ {lvl.upper()} ][/{style}]"
 
 
 class LogUI(App[None]):
@@ -88,7 +86,6 @@ class LogUI(App[None]):
         self.log_path = Path(log_path) if log_path else None
         self.log_entries: list[dict[str, Any]] = []
         self.raw_lines: list[str] = []
-        self.display_key = "timestamp"
         self.hovered_log_index: int | None = None
         self.selected_indices: set[int] = set()
         self.filter_text = ""
@@ -109,14 +106,12 @@ class LogUI(App[None]):
         if self.theme not in self.available_themes:
             self.theme = "logui-dark"
         if self.log_path and self.log_path.exists():
-            self.log_entries, self.raw_lines = load_log_file(self.log_path)
-            if load_used_rust():
-                self.notify("Logs loaded with Rust loader", severity="information")
-            self._filtered_indices = list(range(len(self.log_entries)))
-            keys = all_keys_from_entries(self.log_entries)
-            if keys and self.display_key not in keys:
-                self.display_key = keys[0]
-            self._populate_log_panel()
+            self.push_screen(LoadingScreen(self.log_path))
+            self.run_worker(
+                self._load_log_worker(),
+                exclusive=True,
+                exit_on_error=False,
+            )
         else:
             self.query_one("#log-container", LogContainer).mount(
                 Static("No log file loaded. Run: python app.py <path/to/log.txt>", id="empty-state")
@@ -125,10 +120,45 @@ class LogUI(App[None]):
         schema_tree.display = False
         self.query_one("#schema-placeholder", Static).display = True
 
-    def _update_schema_panel(self, entry: dict[str, Any] | None) -> None:
+    async def _load_log_worker(self) -> tuple[list[dict[str, Any]], list[str]]:
+        """Run load_log_file in a thread so the loading screen can animate."""
+        return await asyncio.to_thread(load_log_file, self.log_path)
+
+    def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
+        """When the load worker finishes, pop the loading screen and show logs."""
+        from textual.worker import WorkerState
+
+        if event.state not in (WorkerState.SUCCESS, WorkerState.ERROR):
+            return
+        # Only react to our load worker (result is (entries, raw_lines) on success)
+        try:
+            if event.state == WorkerState.ERROR:
+                self.pop_screen()
+                self.log_entries = []
+                self.raw_lines = []
+                err = getattr(event.worker, "error", None)
+                msg = str(err) if err else "Failed to parse log file"
+                self.query_one("#log-container", LogContainer).mount(
+                    Static(f"Error: {msg}", id="empty-state")
+                )
+                self.notify(msg, severity="error")
+                return
+            result = event.worker.result
+            if result is None or not isinstance(result, tuple) or len(result) != 2:
+                return
+            self.log_entries, self.raw_lines = result
+        except Exception:
+            return
+        self.pop_screen()
+        if load_used_rust():
+            self.notify("Logs loaded with Rust loader", severity="information")
+        self._filtered_indices = list(range(len(self.log_entries)))
+        self._populate_log_panel()
+
+    def _update_schema_panel(self, the_json: dict[str, Any] | None) -> None:
         tree = self.query_one("#schema-tree", Tree)
         placeholder = self.query_one("#schema-placeholder", Static)
-        if entry is None or entry.get("_parse_error"):
+        if the_json is None or the_json.get("_parse_error"):
             tree.display = False
             placeholder.display = True
             return
@@ -136,7 +166,7 @@ class LogUI(App[None]):
         placeholder.display = False
         tree.clear()
         tree.root.label = "Schema"
-        for key, type_or_children in schema_from_object(entry):
+        for key, type_or_children in schema_from_object(the_json):
             if isinstance(type_or_children, list):
                 node = tree.root.add(key, expand=True)
                 self._add_schema_children(node, type_or_children)
@@ -159,20 +189,18 @@ class LogUI(App[None]):
         for i in self._filtered_indices:
             if i >= len(self.log_entries):
                 continue
-            entry = self.log_entries[i]
-            if entry.get("_parse_error"):
-                title = entry.get("_raw", str(entry))[:60] + ("..." if len(entry.get("_raw", "")) > 60 else "")
+            row = self.log_entries[i]
+            the_json = row.get("the_json", {})
+            if the_json.get("_parse_error"):
+                raw = the_json.get("_raw", str(the_json))
+                title = (raw[:57] + "...") if len(raw) > 60 else raw if raw else "(parse error)"
             else:
-                disp = entry.get(self.display_key, "")
-                if isinstance(disp, dict):
-                    disp = "[object]"
-                elif isinstance(disp, list):
-                    disp = "[array]"
-                else:
-                    disp = str(disp)[:50]
-                title = f"log line  {disp}"
-            pretty = json.dumps(entry, indent=2) if isinstance(entry, dict) else str(entry)
-            badge_text = _level_badge(entry) if not entry.get("_parse_error") else ""
+                level_val = row.get("level", "") or "-"
+                msg_val = row.get("message", "") or "-"
+                ts_val = row.get("timestamp", "") or "-"
+                title = f"level: {level_val} | message: {msg_val} | timestamp: {ts_val}"
+            pretty = json.dumps(the_json, indent=2) if isinstance(the_json, dict) else str(the_json)
+            badge_text = _level_badge_from_level(row.get("level", "")) if not the_json.get("_parse_error") else ""
             children: list[Widget] = []
             if badge_text:
                 children.append(Static(badge_text))
@@ -240,7 +268,7 @@ class LogUI(App[None]):
                     idx = int(control.id.split("-")[-1])
                     if 0 <= idx < len(self.log_entries):
                         self.hovered_log_index = idx
-                        self._update_schema_panel(self.log_entries[idx])
+                        self._update_schema_panel(self.log_entries[idx].get("the_json"))
                 except (ValueError, IndexError):
                     pass
                 return
@@ -262,25 +290,53 @@ class LogUI(App[None]):
             return
         parts = []
         for i in to_copy:
-            if i < len(self.raw_lines):
-                parts.append(self.raw_lines[i])
+            if i < len(self.log_entries):
+                parts.append(self.log_entries[i].get("raw", ""))
             else:
-                parts.append(json.dumps(self.log_entries[i], indent=2))
+                parts.append("")
         self.copy_to_clipboard("\n".join(parts))
         self.notify(f"Copied {len(parts)} line(s)")
 
     def action_log_settings(self) -> None:
-        keys = all_keys_from_entries(self.log_entries)
+        the_jsons = [r.get("the_json", {}) for r in self.log_entries]
+        keys = all_keys_from_entries(the_jsons)
         if not keys:
             self.notify("No log entries to choose key from", severity="warning")
             return
-        self.push_screen(LogSettingsScreen(keys=keys, current=self.display_key), self._on_log_settings_done)
+        level_key, message_key, timestamp_key = infer_display_keys(the_jsons)
+        self.push_screen(
+            LogSettingsScreen(
+                keys=keys,
+                current_level=level_key,
+                current_message=message_key,
+                current_timestamp=timestamp_key,
+            ),
+            self._on_log_settings_done,
+        )
 
-    def _on_log_settings_done(self, key: str | None) -> None:
-        if key:
-            self.display_key = key
-            self._populate_log_panel()
-            self.notify(f"Display key set to {key}")
+    def _on_log_settings_done(self, result: tuple[str | None, str | None, str | None] | None) -> None:
+        if result is None:
+            return
+        level_key, message_key, timestamp_key = result
+        if not self.log_path or not self.log_path.exists():
+            return
+        self.log_entries, self.raw_lines = load_log_file(
+            self.log_path,
+            level_key=level_key or None,
+            message_key=message_key or None,
+            timestamp_key=timestamp_key or None,
+        )
+        if self.filter_text.strip():
+            lower = self.filter_text.lower()
+            self._filtered_indices = [
+                i for i in range(len(self.log_entries))
+                if lower in json.dumps(self.log_entries[i].get("the_json", {})).lower()
+                or lower in self.log_entries[i].get("raw", "").lower()
+            ]
+        else:
+            self._filtered_indices = list(range(len(self.log_entries)))
+        self._populate_log_panel()
+        self.notify("Log key config applied")
 
     def action_filter(self) -> None:
         self.push_screen(FilterScreen(current=self.filter_text), self._on_filter_done)
@@ -295,7 +351,8 @@ class LogUI(App[None]):
             lower = filter_text.lower()
             self._filtered_indices = [
                 i for i in range(len(self.log_entries))
-                if lower in json.dumps(self.log_entries[i]).lower() or lower in self.raw_lines[i].lower()
+                if lower in json.dumps(self.log_entries[i].get("the_json", {})).lower()
+                or lower in self.log_entries[i].get("raw", "").lower()
             ]
         self._populate_log_panel()
         self.notify(f"Filter: {len(self._filtered_indices)} line(s) match")

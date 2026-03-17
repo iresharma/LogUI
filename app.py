@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from rich.text import Text
 from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -21,26 +22,57 @@ from textual.worker import Worker
 from themes import LOGUI_DARK, LOGUI_LIGHT
 
 from log_loader import load_log_file, load_used_rust
-from schema import all_keys_from_entries, infer_display_keys, schema_from_object
+from schema import schema_from_object
 from screens.filter_screen import FilterScreen
 from screens.loading_screen import LoadingScreen
-from screens.log_settings_screen import LogSettingsScreen
 from widgets.log_container import LogContainer
 from widgets.log_ui_header import LogUIHeader
 
 
 VERSION = "v0.0.1"
 
-LEVEL_STYLES = {"info": "dim", "warn": "yellow", "warning": "yellow", "error": "red", "debug": "dim cyan"}
+LEVEL_STYLES = {
+    "success": "bold white on green3",
+    "info": "bold white on steel_blue",
+    "debug": "bold white on steel_blue",
+    "warn": "bold white on dark_orange3",
+    "warning": "bold white on dark_orange3",
+    "error": "bold white on red3",
+}
 
 
 def _level_badge_from_level(level: str) -> str:
-    """Return a Rich/markup string for the log level badge from normalized level string."""
+    """Return a Rich style string for the log level badge background."""
     if not level:
-        return ""
+        return "bold white on #555555"
     lvl = level.strip().lower()
-    style = LEVEL_STYLES.get(lvl, "dim")
-    return f"[{style}][ {lvl.upper()} ][/{style}]"
+    return LEVEL_STYLES.get(lvl, "bold white on #555555")
+
+
+def _build_title_with_timestamp(
+    app: "LogUI", level_val: str, msg_val: str, ts_val: str
+) -> Text:
+    """Build a single-line title with badge + message + right-aligned timestamp."""
+    badge_style = _level_badge_from_level(level_val)
+    left = Text.assemble(
+        (level_val.upper() or "-", badge_style),
+        (": ", "default"),
+        (msg_val or "-", "default"),
+    )
+    if not ts_val:
+        return left
+
+    # Try to push timestamp toward the right edge based on app width.
+    total_width = max(app.size.width - 8, 0)
+    left_width = len(str(left))
+    ts_width = len(ts_val)
+    padding = max(1, total_width - left_width - ts_width)
+
+    title = Text()
+    title.append(left)
+    title.append(" " * padding)
+    title.append(ts_val, style="dim")
+    return title
 
 
 class LogUI(App[None]):
@@ -48,7 +80,7 @@ class LogUI(App[None]):
 
     CSS = """
     #log-container {
-        width: 1fr;
+        width: 5fr;
         min-width: 20;
         overflow-y: auto;
         overflow-x: hidden;
@@ -58,7 +90,7 @@ class LogUI(App[None]):
         border: solid $primary;
     }
     #schema-container {
-        width: 40%;
+        width: 2fr;
         min-width: 24;
         border-left: solid $primary;
         padding: 0 1;
@@ -73,7 +105,6 @@ class LogUI(App[None]):
     BINDINGS = [
         Binding("q", "quit", "Quit", show=True),
         Binding("f", "filter", "Filter", show=True),
-        Binding("c", "log_settings", "Log key config", show=True),
         Binding("t", "theme", "Theme", show=True),
         Binding("space", "toggle_selection", "Select", show=True),
         Binding("ctrl+c", "copy", "Copy", show=True),
@@ -107,17 +138,21 @@ class LogUI(App[None]):
         self.register_theme(LOGUI_LIGHT)
         if self.theme not in self.available_themes:
             self.theme = "logui-dark"
+        container = self.query_one("#log-container", LogContainer)
         if self.log_path and self.log_path.exists():
             self._initial_painted = False
             self._loading_rest = False
-            self.push_screen(LoadingScreen(self.log_path))
+            # Simple in-panel loading state so the user always sees something.
+            container.mount(
+                Static("Loading logs…", id="loading-state")
+            )
             self.run_worker(
                 self._load_log_worker(),
                 exclusive=True,
                 exit_on_error=False,
             )
         else:
-            self.query_one("#log-container", LogContainer).mount(
+            container.mount(
                 Static("No log file loaded. Run: python app.py <path/to/log.txt>", id="empty-state")
             )
         schema_tree = self.query_one("#schema-tree", Tree)
@@ -149,12 +184,6 @@ class LogUI(App[None]):
             return
         self._initial_painted = True
         self._loading_rest = True
-        # Pop the loading screen if it's still present.
-        try:
-            self.pop_screen()
-        except Exception:
-            # If the screen is already gone, ignore.
-            pass
         self.log_entries = entries
         self.raw_lines = raw_lines
         if self.filter_text.strip():
@@ -201,9 +230,14 @@ class LogUI(App[None]):
             self.log_entries, self.raw_lines = result
         except Exception:
             return
-        if not self._initial_painted:
-            # If we never got an initial batch (e.g. Python fallback), pop now.
-            self.pop_screen()
+        # Remove any in-panel loading indicator before showing actual logs.
+        try:
+            container = self.query_one("#log-container", LogContainer)
+            for child in list(container.children):
+                if getattr(child, "id", "") == "loading-state":
+                    child.remove()
+        except Exception:
+            pass
         self._loading_rest = False
         if load_used_rust():
             self.notify("Logs loaded with Rust loader", severity="information")
@@ -249,18 +283,16 @@ class LogUI(App[None]):
             the_json = row.get("the_json", {})
             if the_json.get("_parse_error"):
                 raw = the_json.get("_raw", str(the_json))
-                title = (raw[:57] + "...") if len(raw) > 60 else raw if raw else "(parse error)"
+                title: Any = (raw[:57] + "...") if len(raw) > 60 else raw if raw else "(parse error)"
             else:
-                level_val = row.get("level", "") or "-"
+                level_val = (row.get("level", "") or "-").strip()
                 msg_val = row.get("message", "") or "-"
                 ts_val = row.get("timestamp", "") or "-"
-                title = f"level: {level_val} | message: {msg_val} | timestamp: {ts_val}"
+
+                title = _build_title_with_timestamp(self, level_val, msg_val, ts_val)
+
             pretty = json.dumps(the_json, indent=2) if isinstance(the_json, dict) else str(the_json)
-            badge_text = _level_badge_from_level(row.get("level", "")) if not the_json.get("_parse_error") else ""
-            children: list[Widget] = []
-            if badge_text:
-                children.append(Static(badge_text))
-            children.append(Static(pretty))
+            children: list[Widget] = [Static(pretty)]
             collapsible = Collapsible(
                 *children,
                 title=title,
@@ -354,47 +386,6 @@ class LogUI(App[None]):
                 parts.append("")
         self.copy_to_clipboard("\n".join(parts))
         self.notify(f"Copied {len(parts)} line(s)")
-
-    def action_log_settings(self) -> None:
-        the_jsons = [r.get("the_json", {}) for r in self.log_entries]
-        keys = all_keys_from_entries(the_jsons)
-        if not keys:
-            self.notify("No log entries to choose key from", severity="warning")
-            return
-        level_key, message_key, timestamp_key = infer_display_keys(the_jsons)
-        self.push_screen(
-            LogSettingsScreen(
-                keys=keys,
-                current_level=level_key,
-                current_message=message_key,
-                current_timestamp=timestamp_key,
-            ),
-            self._on_log_settings_done,
-        )
-
-    def _on_log_settings_done(self, result: tuple[str | None, str | None, str | None] | None) -> None:
-        if result is None:
-            return
-        level_key, message_key, timestamp_key = result
-        if not self.log_path or not self.log_path.exists():
-            return
-        self.log_entries, self.raw_lines = load_log_file(
-            self.log_path,
-            level_key=level_key or None,
-            message_key=message_key or None,
-            timestamp_key=timestamp_key or None,
-        )
-        if self.filter_text.strip():
-            lower = self.filter_text.lower()
-            self._filtered_indices = [
-                i for i in range(len(self.log_entries))
-                if lower in json.dumps(self.log_entries[i].get("the_json", {})).lower()
-                or lower in self.log_entries[i].get("raw", "").lower()
-            ]
-        else:
-            self._filtered_indices = list(range(len(self.log_entries)))
-        self._populate_log_panel()
-        self.notify("Log key config applied")
 
     def action_filter(self) -> None:
         self.push_screen(FilterScreen(current=self.filter_text), self._on_filter_done)

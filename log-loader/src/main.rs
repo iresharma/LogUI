@@ -12,12 +12,14 @@ const LEVEL_CANDIDATES: &[&str] = &["level", "log_level", "severity", "level_nam
 const MESSAGE_CANDIDATES: &[&str] = &["message", "msg", "error", "error_message", "text", "summary", "body"];
 const TIMESTAMP_CANDIDATES: &[&str] = &["timestamp", "time", "ts", "@timestamp", "created_at", "date", "datetime"];
 const MESSAGE_TRUNCATE: usize = 50;
+const INITIAL_BATCH_LINES: usize = 500;
 
 struct Config {
     path: String,
     level_key: Option<String>,
     message_key: Option<String>,
     timestamp_key: Option<String>,
+    stream: bool,
 }
 
 fn parse_args(args: &[String]) -> Option<Config> {
@@ -25,6 +27,7 @@ fn parse_args(args: &[String]) -> Option<Config> {
     let mut level_key = None;
     let mut message_key = None;
     let mut timestamp_key = None;
+    let mut stream = false;
     for arg in args.iter().skip(1) {
         if let Some(v) = arg.strip_prefix("--level-key=") {
             level_key = Some(v.to_string());
@@ -32,6 +35,8 @@ fn parse_args(args: &[String]) -> Option<Config> {
             message_key = Some(v.to_string());
         } else if let Some(v) = arg.strip_prefix("--timestamp-key=") {
             timestamp_key = Some(v.to_string());
+        } else if arg == "--stream" {
+            stream = true;
         } else if !arg.starts_with('-') {
             path = Some(arg.clone());
         }
@@ -41,6 +46,7 @@ fn parse_args(args: &[String]) -> Option<Config> {
         level_key,
         message_key,
         timestamp_key,
+        stream,
     })
 }
 
@@ -49,12 +55,20 @@ fn main() {
     let config = match parse_args(&args) {
         Some(c) => c,
         None => {
-            eprintln!("Usage: log-loader <path> [--level-key=K] [--message-key=K] [--timestamp-key=K]");
+            eprintln!(
+                "Usage: log-loader <path> [--level-key=K] [--message-key=K] [--timestamp-key=K] [--stream]"
+            );
             exit(1);
         }
     };
 
-    if let Err(e) = run(&config) {
+    let result = if config.stream {
+        run_stream(&config)
+    } else {
+        run(&config)
+    };
+
+    if let Err(e) = result {
         eprintln!("log-loader: {}", e);
         exit(1);
     }
@@ -68,6 +82,48 @@ fn main() {
 struct Parsed<'a> {
     raw: &'a str,
     entry: Value,
+}
+
+fn write_row(
+    row_buf: &mut Vec<u8>,
+    out: &mut BufWriter<io::StdoutLock<'_>>,
+    entry: &Value,
+    raw: &str,
+    lk: Option<&str>,
+    mk: Option<&str>,
+    tk: Option<&str>,
+    level_buf: &mut String,
+    msg_buf: &mut String,
+    ts_buf: &mut String,
+) -> io::Result<()> {
+    let is_err = is_parse_error(entry);
+
+    if is_err {
+        level_buf.clear();
+        msg_buf.clear();
+        ts_buf.clear();
+    } else if let Some(obj) = entry.as_object() {
+        extract_string_into(level_buf, obj, lk, 12);
+        extract_message_into(msg_buf, obj, mk);
+        extract_string_into(ts_buf, obj, tk, 80);
+    }
+
+    row_buf.clear();
+    row_buf.extend_from_slice(b"{\"level\":");
+    write_json_str(row_buf, level_buf);
+    row_buf.extend_from_slice(b",\"message\":");
+    write_json_str(row_buf, msg_buf);
+    row_buf.extend_from_slice(b",\"timestamp\":");
+    write_json_str(row_buf, ts_buf);
+    row_buf.extend_from_slice(b",\"the_json\":");
+    serde_json::to_writer(row_buf, entry)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    row_buf.extend_from_slice(b",\"raw\":");
+    write_json_str(row_buf, raw);
+    row_buf.push(b'}');
+    row_buf.push(b'\n');
+
+    out.write_all(row_buf)
 }
 
 fn run(config: &Config) -> io::Result<()> {
@@ -142,38 +198,141 @@ fn run(config: &Config) -> io::Result<()> {
     let mut row_buf: Vec<u8> = Vec::with_capacity(8192);
 
     for pl in &parsed {
-        let is_err = is_parse_error(&pl.entry);
+        write_row(
+            &mut row_buf,
+            &mut out,
+            &pl.entry,
+            pl.raw,
+            lk,
+            mk,
+            tk,
+            &mut level_buf,
+            &mut msg_buf,
+            &mut ts_buf,
+        )?;
+    }
+    out.flush()?;
+    Ok(())
+}
 
-        if is_err {
-            level_buf.clear();
-            msg_buf.clear();
-            ts_buf.clear();
-        } else {
-            let obj = pl.entry.as_object().unwrap();
-            extract_string_into(&mut level_buf, obj, lk, 12);
-            extract_message_into(&mut msg_buf, obj, mk);
-            extract_string_into(&mut ts_buf, obj, tk, 80);
+fn run_stream(config: &Config) -> io::Result<()> {
+    let path = Path::new(&config.path);
+    if !path.exists() {
+        return Ok(());
+    }
+
+    // For now, reuse the same in-memory parsing as `run`, but change
+    // output ordering and insert batch markers so the Python UI can
+    // paint tail-first.
+    let content = fs::read_to_string(path)?;
+    let line_refs: Vec<&str> = content
+        .split('\n')
+        .map(|l| l.strip_suffix('\r').unwrap_or(l))
+        .collect();
+
+    let mut level_counts  = [0u32; 5];
+    let mut msg_counts    = [0u32; 7];
+    let mut ts_counts     = [0u32; 7];
+    let mut parsed: Vec<Parsed> = Vec::with_capacity(line_refs.len());
+
+    for &raw in &line_refs {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let entry = parse_line(trimmed);
+
+        if let Some(obj) = entry.as_object() {
+            if !obj.contains_key("_parse_error") {
+                for (i, &k) in LEVEL_CANDIDATES.iter().enumerate() {
+                    if obj.contains_key(k) { level_counts[i] += 1; }
+                }
+                for (i, &k) in MESSAGE_CANDIDATES.iter().enumerate() {
+                    if obj.contains_key(k) { msg_counts[i] += 1; }
+                }
+                for (i, &k) in TIMESTAMP_CANDIDATES.iter().enumerate() {
+                    if obj.contains_key(k) { ts_counts[i] += 1; }
+                }
+            }
         }
 
-        // Build the entire row in `row_buf`, then do a single write_all.
-        row_buf.clear();
-        row_buf.extend_from_slice(b"{\"level\":");
-        write_json_str(&mut row_buf, &level_buf);
-        row_buf.extend_from_slice(b",\"message\":");
-        write_json_str(&mut row_buf, &msg_buf);
-        row_buf.extend_from_slice(b",\"timestamp\":");
-        write_json_str(&mut row_buf, &ts_buf);
-        row_buf.extend_from_slice(b",\"the_json\":");
-        // serde_json::to_writer into Vec<u8> is just a memcpy – no syscalls.
-        serde_json::to_writer(&mut row_buf, &pl.entry)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        row_buf.extend_from_slice(b",\"raw\":");
-        write_json_str(&mut row_buf, pl.raw);
-        row_buf.push(b'}');
-        row_buf.push(b'\n');
-
-        out.write_all(&row_buf)?;
+        parsed.push(Parsed { raw, entry });
     }
+
+    let level_key = config.level_key.clone()
+        .or_else(|| pick_best(LEVEL_CANDIDATES, &level_counts));
+    let message_key = config.message_key.clone()
+        .or_else(|| pick_best(MESSAGE_CANDIDATES, &msg_counts));
+    let timestamp_key = config.timestamp_key.clone()
+        .or_else(|| pick_best(TIMESTAMP_CANDIDATES, &ts_counts));
+
+    let lk = level_key.as_deref();
+    let mk = message_key.as_deref();
+    let tk = timestamp_key.as_deref();
+
+    let stdout = io::stdout();
+    let mut out = BufWriter::with_capacity(256 * 1024, stdout.lock());
+
+    let mut level_buf = String::with_capacity(64);
+    let mut msg_buf   = String::with_capacity(256);
+    let mut ts_buf    = String::with_capacity(128);
+    let mut row_buf: Vec<u8> = Vec::with_capacity(8192);
+
+    let total = parsed.len();
+    if total == 0 {
+        return Ok(());
+    }
+
+    let tail_start = if total > INITIAL_BATCH_LINES {
+        total - INITIAL_BATCH_LINES
+    } else {
+        0
+    };
+
+    // Tail: newest lines first (reverse file order over tail slice).
+    for idx in (tail_start..total).rev() {
+        let pl = &parsed[idx];
+        write_row(
+            &mut row_buf,
+            &mut out,
+            &pl.entry,
+            pl.raw,
+            lk,
+            mk,
+            tk,
+            &mut level_buf,
+            &mut msg_buf,
+            &mut ts_buf,
+        )?;
+    }
+
+    // Batch marker so Python UI can paint after tail.
+    row_buf.clear();
+    row_buf.extend_from_slice(b"{\"_batch\":\"tail_done\"}\n");
+    out.write_all(&row_buf)?;
+
+    // Head: everything before tail, also newest-first within that block.
+    if tail_start > 0 {
+        for idx in (0..tail_start).rev() {
+            let pl = &parsed[idx];
+            write_row(
+                &mut row_buf,
+                &mut out,
+                &pl.entry,
+                pl.raw,
+                lk,
+                mk,
+                tk,
+                &mut level_buf,
+                &mut msg_buf,
+                &mut ts_buf,
+            )?;
+        }
+    }
+
+    row_buf.clear();
+    row_buf.extend_from_slice(b"{\"_batch\":\"done\"}\n");
+    out.write_all(&row_buf)?;
     out.flush()?;
     Ok(())
 }

@@ -11,7 +11,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from schema import infer_display_keys
 
@@ -86,6 +86,77 @@ def _load_via_rust(
         except (json.JSONDecodeError, TypeError):
             continue
     raw_lines = [r.get("raw", "") for r in rows]
+    return rows, raw_lines
+
+
+def _load_via_rust_stream(
+    path: Path,
+    level_key: str | None = None,
+    message_key: str | None = None,
+    timestamp_key: str | None = None,
+    on_initial_batch: Callable[[list[dict[str, Any]], list[str]], None] | None = None,
+) -> tuple[list[dict[str, Any]], list[str]] | None:
+    """Run Rust binary in streaming mode and parse NDJSON stdout.
+
+    Returns (rows, raw_lines) or None if the Rust binary is unavailable or fails.
+    """
+    binary = _rust_binary_path()
+    if not binary:
+        return None
+    argv = [str(binary), str(path), "--stream"]
+    if level_key:
+        argv.append(f"--level-key={level_key}")
+    if message_key:
+        argv.append(f"--message-key={message_key}")
+    if timestamp_key:
+        argv.append(f"--timestamp-key={timestamp_key}")
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+    except OSError:
+        return None
+
+    rows: list[dict[str, Any]] = []
+    raw_lines: list[str] = []
+    sent_initial = False
+
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        batch = obj.get("_batch")
+        if batch == "tail_done":
+            if on_initial_batch is not None and not sent_initial:
+                # Make a shallow copy so the caller can't mutate our buffers.
+                on_initial_batch(list(rows), list(raw_lines))
+                sent_initial = True
+            continue
+        if batch == "done":
+            break
+        if "the_json" not in obj or "raw" not in obj:
+            continue
+        rows.append(obj)
+        raw_lines.append(obj.get("raw", ""))
+
+    try:
+        proc.wait(timeout=300)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        return None
+    if proc.returncode not in (0, None) and not rows:
+        return None
     return rows, raw_lines
 
 
@@ -172,6 +243,7 @@ def load_log_file(
     level_key: str | None = None,
     message_key: str | None = None,
     timestamp_key: str | None = None,
+    on_initial_batch: Callable[[list[dict[str, Any]], list[str]], None] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Read a log file and return normalized rows.
 
@@ -186,6 +258,20 @@ def load_log_file(
     if not path.exists():
         _used_rust = False
         return [], []
+
+    # If a callback is provided, prefer streaming mode so the UI can paint
+    # after the tail batch is ready.
+    if on_initial_batch is not None:
+        rust_stream_result = _load_via_rust_stream(
+            path,
+            level_key=level_key,
+            message_key=message_key,
+            timestamp_key=timestamp_key,
+            on_initial_batch=on_initial_batch,
+        )
+        if rust_stream_result is not None:
+            _used_rust = True
+            return rust_stream_result
 
     rust_result = _load_via_rust(path, level_key, message_key, timestamp_key)
     if rust_result is not None:

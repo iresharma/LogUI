@@ -90,6 +90,8 @@ class LogUI(App[None]):
         self.selected_indices: set[int] = set()
         self.filter_text = ""
         self._filtered_indices: list[int] = []
+        self._initial_painted: bool = False
+        self._loading_rest: bool = False
 
     def compose(self) -> ComposeResult:
         yield LogUIHeader(version=VERSION)
@@ -106,6 +108,8 @@ class LogUI(App[None]):
         if self.theme not in self.available_themes:
             self.theme = "logui-dark"
         if self.log_path and self.log_path.exists():
+            self._initial_painted = False
+            self._loading_rest = False
             self.push_screen(LoadingScreen(self.log_path))
             self.run_worker(
                 self._load_log_worker(),
@@ -122,7 +126,48 @@ class LogUI(App[None]):
 
     async def _load_log_worker(self) -> tuple[list[dict[str, Any]], list[str]]:
         """Run load_log_file in a thread so the loading screen can animate."""
-        return await asyncio.to_thread(load_log_file, self.log_path)
+        def on_initial_batch(entries: list[dict[str, Any]], raw_lines: list[str]) -> None:
+            # Called from worker thread; hop back to the main thread.
+            self.call_from_thread(self._on_initial_batch_from_worker, entries, raw_lines)
+
+        return await asyncio.to_thread(
+            load_log_file,
+            self.log_path,
+            None,
+            None,
+            None,
+            on_initial_batch,
+        )
+
+    def _on_initial_batch_from_worker(
+        self,
+        entries: list[dict[str, Any]],
+        raw_lines: list[str],
+    ) -> None:
+        """Handle the initial tail batch arriving from the loader thread."""
+        if self._initial_painted:
+            return
+        self._initial_painted = True
+        self._loading_rest = True
+        # Pop the loading screen if it's still present.
+        try:
+            self.pop_screen()
+        except Exception:
+            # If the screen is already gone, ignore.
+            pass
+        self.log_entries = entries
+        self.raw_lines = raw_lines
+        if self.filter_text.strip():
+            lower = self.filter_text.lower()
+            self._filtered_indices = [
+                i
+                for i in range(len(self.log_entries))
+                if lower in json.dumps(self.log_entries[i].get("the_json", {})).lower()
+                or lower in self.log_entries[i].get("raw", "").lower()
+            ]
+        else:
+            self._filtered_indices = list(range(len(self.log_entries)))
+        self._populate_log_panel()
 
     def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
         """When the load worker finishes, pop the loading screen and show logs."""
@@ -133,7 +178,14 @@ class LogUI(App[None]):
         # Only react to our load worker (result is (entries, raw_lines) on success)
         try:
             if event.state == WorkerState.ERROR:
-                self.pop_screen()
+                # If we've already painted the initial tail batch, the loading
+                # screen has been popped in _on_initial_batch_from_worker.
+                # Avoid popping again here, which would remove the main app UI.
+                if not self._initial_painted:
+                    try:
+                        self.pop_screen()
+                    except Exception:
+                        pass
                 self.log_entries = []
                 self.raw_lines = []
                 err = getattr(event.worker, "error", None)
@@ -149,7 +201,10 @@ class LogUI(App[None]):
             self.log_entries, self.raw_lines = result
         except Exception:
             return
-        self.pop_screen()
+        if not self._initial_painted:
+            # If we never got an initial batch (e.g. Python fallback), pop now.
+            self.pop_screen()
+        self._loading_rest = False
         if load_used_rust():
             self.notify("Logs loaded with Rust loader", severity="information")
         self._filtered_indices = list(range(len(self.log_entries)))
@@ -186,6 +241,7 @@ class LogUI(App[None]):
         container = self.query_one("#log-container", LogContainer)
         for child in list(container.children):
             child.remove()
+        collapsibles: list[Collapsible] = []
         for i in self._filtered_indices:
             if i >= len(self.log_entries):
                 continue
@@ -213,9 +269,11 @@ class LogUI(App[None]):
                 expanded_symbol="▼",
                 id=f"log-line-{i}",
             )
-            container.mount(collapsible)
             if i in self.selected_indices:
                 collapsible.add_class("-selected")
+            collapsibles.append(collapsible)
+        if collapsibles:
+            container.mount(*collapsibles)
 
     def action_focus_schema(self) -> None:
         """Move focus to the schema panel (tree or placeholder)."""

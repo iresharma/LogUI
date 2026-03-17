@@ -1,0 +1,12 @@
+[package]
+name = "rust_fuzzy"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "rust_fuzzy"
+crate-type = ["cdylib"]
+
+[dependencies]
+fuzzy-matcher = "0.3"
+libc = "0.2"

@@ -5,6 +5,7 @@ from __future__ import annotations
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Label
 
@@ -34,6 +35,18 @@ class FilterScreen(ModalScreen[str]):
 
     def on_mount(self) -> None:
         self.query_one("#filter-input", Input).focus()
+
+    class Changed(Message):
+        """Message emitted when the filter text changes."""
+
+        def __init__(self, value: str) -> None:
+            super().__init__()
+            self.value = value
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "filter-input":
+            # Live-update: inform the app without closing the dialog.
+            self.post_message(self.Changed(event.value or ""))
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         inp = self.query_one("#filter-input", Input)

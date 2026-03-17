@@ -22,11 +22,13 @@ from textual.worker import Worker
 from themes import LOGUI_DARK, LOGUI_LIGHT
 
 from log_loader import load_log_file, load_used_rust
+from rust_fuzzy import fuzzy_match
 from schema import schema_from_object
 from screens.filter_screen import FilterScreen
 from screens.loading_screen import LoadingScreen
 from widgets.log_container import LogContainer
 from widgets.log_ui_header import LogUIHeader
+from widgets.search_bar import SearchBar
 
 
 VERSION = "v0.0.1"
@@ -100,11 +102,18 @@ class LogUI(App[None]):
         text-style: italic;
         color: $text-muted;
     }
+    Collapsible.-search-current {
+        background: $accent 20%;
+        border: solid $accent;
+    }
     """
 
     BINDINGS = [
         Binding("q", "quit", "Quit", show=True),
         Binding("f", "filter", "Filter", show=True),
+        Binding("/", "search", "Search", show=True),
+        Binding("n", "search_next", "Next match", show=False),
+        Binding("shift+n", "search_prev", "Prev match", show=False),
         Binding("t", "theme", "Theme", show=True),
         Binding("space", "toggle_selection", "Select", show=True),
         Binding("ctrl+c", "copy", "Copy", show=True),
@@ -121,6 +130,10 @@ class LogUI(App[None]):
         self.selected_indices: set[int] = set()
         self.filter_text = ""
         self._filtered_indices: list[int] = []
+        self.search_text: str = ""
+        self._search_indices: list[int] = []
+        self._search_pos: int | None = None
+        self._search_active: bool = False
         self._initial_painted: bool = False
         self._loading_rest: bool = False
 
@@ -131,6 +144,7 @@ class LogUI(App[None]):
             with Vertical(id="schema-container"):
                 yield Static("Schema (hover a log line)", id="schema-placeholder")
                 yield Tree("Schema", id="schema-tree")
+        yield SearchBar(id="search-bar")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -186,16 +200,7 @@ class LogUI(App[None]):
         self._loading_rest = True
         self.log_entries = entries
         self.raw_lines = raw_lines
-        if self.filter_text.strip():
-            lower = self.filter_text.lower()
-            self._filtered_indices = [
-                i
-                for i in range(len(self.log_entries))
-                if lower in json.dumps(self.log_entries[i].get("the_json", {})).lower()
-                or lower in self.log_entries[i].get("raw", "").lower()
-            ]
-        else:
-            self._filtered_indices = list(range(len(self.log_entries)))
+        self._recompute_filtered_indices()
         self._populate_log_panel()
 
     def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
@@ -241,7 +246,7 @@ class LogUI(App[None]):
         self._loading_rest = False
         if load_used_rust():
             self.notify("Logs loaded with Rust loader", severity="information")
-        self._filtered_indices = list(range(len(self.log_entries)))
+        self._recompute_filtered_indices()
         self._populate_log_panel()
 
     def _update_schema_panel(self, the_json: dict[str, Any] | None) -> None:
@@ -299,13 +304,25 @@ class LogUI(App[None]):
                 collapsed=True,
                 collapsed_symbol="→",
                 expanded_symbol="▼",
-                id=f"log-line-{i}",
             )
+            # Attach logical index without relying on a global ID.
+            setattr(collapsible, "log_index", i)
             if i in self.selected_indices:
                 collapsible.add_class("-selected")
+            if (
+                self._search_indices
+                and self._search_pos is not None
+                and i == self._search_indices[self._search_pos]
+            ):
+                collapsible.add_class("-search-current")
             collapsibles.append(collapsible)
         if collapsibles:
             container.mount(*collapsibles)
+
+        # After repopulating, if there is an active search, try to keep the current hit focused.
+        if self._search_active and self._search_indices and self._search_pos is not None:
+            idx = self._search_indices[self._search_pos]
+            self._focus_log_row(idx)
 
     def action_focus_schema(self) -> None:
         """Move focus to the schema panel (tree or placeholder)."""
@@ -321,7 +338,7 @@ class LogUI(App[None]):
     def action_focus_log_list(self) -> None:
         """Move focus to the log list (first row or container)."""
         container = self.query_one("#log-container", LogContainer)
-        rows = [c for c in container.children if getattr(c, "id", None) and str(c.id).startswith("log-line-")]
+        rows = [c for c in container.children if isinstance(c, Collapsible)]
         if rows:
             try:
                 title = rows[0].query_one("CollapsibleTitle")
@@ -332,20 +349,30 @@ class LogUI(App[None]):
         else:
             self.screen.set_focus(container)
 
+    def _focus_log_row(self, logical_index: int) -> None:
+        """Focus and scroll to the row whose logical log_index matches."""
+        container = self.query_one("#log-container", LogContainer)
+        for row in container.children:
+            if isinstance(row, Collapsible) and getattr(row, "log_index", None) == logical_index:
+                try:
+                    title = row.query_one("CollapsibleTitle")
+                    self.screen.set_focus(title)
+                    row.scroll_visible()
+                except NoMatches:
+                    pass
+                break
+
     def action_toggle_selection(self) -> None:
         focused = self.focused
         while focused:
-            if focused.id and focused.id.startswith("log-line-"):
-                try:
-                    idx = int(focused.id.split("-")[-1])
-                    if idx in self.selected_indices:
-                        self.selected_indices.discard(idx)
-                        focused.remove_class("-selected")
-                    else:
-                        self.selected_indices.add(idx)
-                        focused.add_class("-selected")
-                except (ValueError, IndexError):
-                    pass
+            idx = getattr(focused, "log_index", None)
+            if isinstance(idx, int):
+                if idx in self.selected_indices:
+                    self.selected_indices.discard(idx)
+                    focused.remove_class("-selected")
+                else:
+                    self.selected_indices.add(idx)
+                    focused.add_class("-selected")
                 return
             focused = getattr(focused, "parent", None)
 
@@ -353,17 +380,25 @@ class LogUI(App[None]):
     def _on_descendant_focus(self, event: DescendantFocus) -> None:
         control: Widget | None = event.control
         while control:
-            if control.id and control.id.startswith("log-line-"):
-                try:
-                    idx = int(control.id.split("-")[-1])
-                    if 0 <= idx < len(self.log_entries):
-                        self.hovered_log_index = idx
-                        self._update_schema_panel(self.log_entries[idx].get("the_json"))
-                except (ValueError, IndexError):
-                    pass
+            idx = getattr(control, "log_index", None)
+            if isinstance(idx, int) and 0 <= idx < len(self.log_entries):
+                self.hovered_log_index = idx
+                self._update_schema_panel(self.log_entries[idx].get("the_json"))
                 return
             control = getattr(control, "parent", None)
         self.hovered_log_index = None
+
+    def on_search_bar_changed(self, message: SearchBar.Changed) -> None:
+        """Live-update search when the search bar text changes."""
+        self._on_search_changed(message.value)
+
+    def on_search_bar_submitted(self, message: SearchBar.Submitted) -> None:
+        """Handle Enter from the search bar."""
+        self._on_search_submitted(message.value)
+
+    def on_search_bar_cancelled(self, message: SearchBar.Cancelled) -> None:
+        """Exit search mode on Esc from the search bar."""
+        self._on_search_cancelled()
 
     def action_quit(self) -> None:
         self.exit()
@@ -387,6 +422,104 @@ class LogUI(App[None]):
         self.copy_to_clipboard("\n".join(parts))
         self.notify(f"Copied {len(parts)} line(s)")
 
+    def action_search(self) -> None:
+        """Enter Vim-style search mode and focus the search bar."""
+        self._search_active = True
+        search_bar = self.query_one("#search-bar", SearchBar)
+        search_bar.display = True
+        search_bar.set_value(self.search_text)
+        search_bar.focus_input()
+        # Recompute matches for the current text, if any.
+        self._recompute_search_indices()
+
+    def action_search_next(self) -> None:
+        """Jump to the next search match (n)."""
+        if not self._search_indices:
+            return
+        if self._search_pos is None:
+            self._search_pos = 0
+        else:
+            self._search_pos = (self._search_pos + 1) % len(self._search_indices)
+        self._focus_log_row(self._search_indices[self._search_pos])
+        self._update_search_status()
+
+    def action_search_prev(self) -> None:
+        """Jump to the previous search match (N / shift+n)."""
+        if not self._search_indices:
+            return
+        if self._search_pos is None:
+            self._search_pos = 0
+        else:
+            self._search_pos = (self._search_pos - 1) % len(self._search_indices)
+        self._focus_log_row(self._search_indices[self._search_pos])
+        self._update_search_status()
+
+    def _recompute_search_indices(self) -> None:
+        """Recompute search matches over the current filtered indices."""
+        pattern = self.search_text.strip()
+        self._search_indices = []
+        self._search_pos = None
+
+        if not pattern:
+            self._update_search_status()
+            return
+
+        scored: list[tuple[int, int]] = []
+        for idx in self._filtered_indices:
+            if idx >= len(self.log_entries):
+                continue
+            row = self.log_entries[idx]
+            the_json = row.get("the_json", {})
+            raw = row.get("raw", "")
+            try:
+                json_part = json.dumps(the_json)
+            except TypeError:
+                json_part = str(the_json)
+            candidate = f"{json_part}\n{raw}"
+            score = fuzzy_match(pattern, candidate)
+            if isinstance(score, (int, float)) and score >= 0:
+                scored.append((int(score), idx))
+
+        scored.sort(key=lambda t: (-t[0], t[1]))
+        self._search_indices = [idx for _, idx in scored]
+        if self._search_indices:
+            self._search_pos = 0
+            self._focus_log_row(self._search_indices[0])
+        self._update_search_status()
+
+    def _update_search_status(self) -> None:
+        """Update the search bar's status label with match counts."""
+        try:
+            search_bar = self.query_one("#search-bar", SearchBar)
+        except NoMatches:
+            return
+        total = len(self._search_indices)
+        if total == 0 or self.search_text.strip() == "":
+            status = ""
+        else:
+            current = (self._search_pos or 0) + 1 if self._search_pos is not None else 1
+            status = f"{current}/{total}"
+        search_bar.update_status(status)
+
+    def _on_search_changed(self, value: str) -> None:
+        """Handle live search text changes from the search bar."""
+        self.search_text = value
+        self._recompute_search_indices()
+
+    def _on_search_submitted(self, value: str) -> None:
+        """Handle Enter from the search bar."""
+        self.search_text = value
+        self._recompute_search_indices()
+
+    def _on_search_cancelled(self) -> None:
+        """Exit search mode and hide the search bar."""
+        self._search_active = False
+        try:
+            search_bar = self.query_one("#search-bar", SearchBar)
+            search_bar.display = False
+        except NoMatches:
+            pass
+
     def action_filter(self) -> None:
         self.push_screen(FilterScreen(current=self.filter_text), self._on_filter_done)
 
@@ -394,17 +527,41 @@ class LogUI(App[None]):
         if filter_text is None:
             return
         self.filter_text = filter_text
-        if not filter_text.strip():
-            self._filtered_indices = list(range(len(self.log_entries)))
-        else:
-            lower = filter_text.lower()
-            self._filtered_indices = [
-                i for i in range(len(self.log_entries))
-                if lower in json.dumps(self.log_entries[i].get("the_json", {})).lower()
-                or lower in self.log_entries[i].get("raw", "").lower()
-            ]
+        self._recompute_filtered_indices()
+        # Filter affects which rows are visible; recompute search matches if needed.
+        if self.search_text.strip():
+            self._recompute_search_indices()
         self._populate_log_panel()
         self.notify(f"Filter: {len(self._filtered_indices)} line(s) match")
+
+    @on(FilterScreen.Changed)
+    def _on_filter_changed_live(self, event: FilterScreen.Changed) -> None:
+        """Live-update filtering while the filter dialog is open."""
+        self.filter_text = event.value
+        self._recompute_filtered_indices()
+        self._populate_log_panel()
+        if self.search_text.strip():
+            self._recompute_search_indices()
+
+    def _recompute_filtered_indices(self) -> None:
+        """Recompute which log indices match the current filter text."""
+        if not self.filter_text.strip():
+            self._filtered_indices = list(range(len(self.log_entries)))
+            return
+
+        pattern = self.filter_text
+        indices: list[int] = []
+        for i, row in enumerate(self.log_entries):
+            the_json = row.get("the_json", {})
+            raw = row.get("raw", "")
+            try:
+                json_part = json.dumps(the_json)
+            except TypeError:
+                json_part = str(the_json)
+            candidate = f"{json_part}\n{raw}"
+            if fuzzy_match(pattern, candidate):
+                indices.append(i)
+        self._filtered_indices = indices
 
 
 if __name__ == "__main__":

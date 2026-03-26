@@ -18,11 +18,11 @@ class LogContainer(ScrollableContainer):
     ]
 
     def _log_rows(self) -> list[Widget]:
-        """Collapsible children with log-line-* id."""
+        """Collapsible rows with a logical log_index (set by LogUI)."""
         return [
             c
             for c in self.children
-            if isinstance(c, Collapsible) and c.id and c.id.startswith("log-line-")
+            if isinstance(c, Collapsible) and getattr(c, "log_index", None) is not None
         ]
 
     def _focused_row_index(self) -> int | None:

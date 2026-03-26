@@ -22,10 +22,7 @@ from textual.worker import Worker
 from themes import LOGUI_DARK, LOGUI_LIGHT
 
 from log_loader import load_log_file, load_used_rust
-from rust_fuzzy import fuzzy_match
 from schema import schema_from_object
-from screens.filter_screen import FilterScreen
-from screens.loading_screen import LoadingScreen
 from widgets.log_container import LogContainer
 from widgets.log_ui_header import LogUIHeader
 from widgets.search_bar import SearchBar
@@ -42,6 +39,8 @@ LEVEL_STYLES = {
     "error": "bold white on red3",
 }
 
+SEARCH_HIT_STYLE = "bold reverse"
+
 
 def _level_badge_from_level(level: str) -> str:
     """Return a Rich style string for the log level badge background."""
@@ -49,6 +48,27 @@ def _level_badge_from_level(level: str) -> str:
         return "bold white on #555555"
     lvl = level.strip().lower()
     return LEVEL_STYLES.get(lvl, "bold white on #555555")
+
+
+def _append_highlighted_plain(out: Text, s: str, query: str, base_style: str) -> None:
+    """Append plain string `s` to `out`, highlighting case-insensitive `query` spans."""
+    q = (query or "").strip()
+    if not q:
+        out.append(s, base_style)
+        return
+    q_lower = q.lower()
+    lower = s.lower()
+    pos = 0
+    n = len(q)
+    while pos < len(s):
+        i = lower.find(q_lower, pos)
+        if i == -1:
+            out.append(s[pos:], base_style)
+            break
+        if i > pos:
+            out.append(s[pos:i], base_style)
+        out.append(s[i : i + n], SEARCH_HIT_STYLE)
+        pos = i + n
 
 
 def _build_title_with_timestamp(
@@ -64,7 +84,6 @@ def _build_title_with_timestamp(
     if not ts_val:
         return left
 
-    # Try to push timestamp toward the right edge based on app width.
     total_width = max(app.size.width - 8, 0)
     left_width = len(str(left))
     ts_width = len(ts_val)
@@ -74,6 +93,36 @@ def _build_title_with_timestamp(
     title.append(left)
     title.append(" " * padding)
     title.append(ts_val, style="dim")
+    return title
+
+
+def _build_title_with_search_highlight(
+    app: "LogUI",
+    level_val: str,
+    msg_val: str,
+    ts_val: str,
+    query: str,
+) -> Text:
+    """Same as title row but with substring highlights for `query` in message and timestamp."""
+    q = (query or "").strip()
+    if not q:
+        return _build_title_with_timestamp(app, level_val, msg_val, ts_val)
+
+    badge_style = _level_badge_from_level(level_val)
+    title = Text()
+    title.append(level_val.upper() or "-", badge_style)
+    title.append(": ", "default")
+    _append_highlighted_plain(title, msg_val or "-", q, "default")
+
+    if ts_val:
+        left_plain = f"{level_val.upper() or '-'}: {msg_val or '-'}"
+        total_width = max(app.size.width - 8, 0)
+        left_width = len(left_plain)
+        ts_width = len(ts_val)
+        padding = max(1, total_width - left_width - ts_width)
+        title.append(" " * padding)
+        _append_highlighted_plain(title, ts_val, q, "dim")
+
     return title
 
 
@@ -110,8 +159,9 @@ class LogUI(App[None]):
 
     BINDINGS = [
         Binding("q", "quit", "Quit", show=True),
-        Binding("f", "filter", "Filter", show=True),
+        Binding("f", "search", "Search", show=True),
         Binding("/", "search", "Search", show=True),
+        Binding("escape", "search_escape", "Close search", show=False, priority=True),
         Binding("n", "search_next", "Next match", show=False),
         Binding("shift+n", "search_prev", "Prev match", show=False),
         Binding("t", "theme", "Theme", show=True),
@@ -128,14 +178,26 @@ class LogUI(App[None]):
         self.raw_lines: list[str] = []
         self.hovered_log_index: int | None = None
         self.selected_indices: set[int] = set()
-        self.filter_text = ""
-        self._filtered_indices: list[int] = []
         self.search_text: str = ""
+        self._search_buffers: list[str] = []
+        self._filtered_indices: list[int] = []
         self._search_indices: list[int] = []
         self._search_pos: int | None = None
         self._search_active: bool = False
         self._initial_painted: bool = False
         self._loading_rest: bool = False
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        """Only handle Escape as search-cancel when the search bar is open."""
+        if action == "search_escape":
+            try:
+                bar = self.query_one("#search-bar", SearchBar)
+            except NoMatches:
+                return False
+            if bar.display and self._search_active:
+                return True
+            return False
+        return super().check_action(action, parameters)
 
     def compose(self) -> ComposeResult:
         yield LogUIHeader(version=VERSION)
@@ -156,7 +218,6 @@ class LogUI(App[None]):
         if self.log_path and self.log_path.exists():
             self._initial_painted = False
             self._loading_rest = False
-            # Simple in-panel loading state so the user always sees something.
             container.mount(
                 Static("Loading logs…", id="loading-state")
             )
@@ -175,8 +236,8 @@ class LogUI(App[None]):
 
     async def _load_log_worker(self) -> tuple[list[dict[str, Any]], list[str]]:
         """Run load_log_file in a thread so the loading screen can animate."""
+
         def on_initial_batch(entries: list[dict[str, Any]], raw_lines: list[str]) -> None:
-            # Called from worker thread; hop back to the main thread.
             self.call_from_thread(self._on_initial_batch_from_worker, entries, raw_lines)
 
         return await asyncio.to_thread(
@@ -200,8 +261,8 @@ class LogUI(App[None]):
         self._loading_rest = True
         self.log_entries = entries
         self.raw_lines = raw_lines
-        self._recompute_filtered_indices()
-        self._populate_log_panel()
+        self._rebuild_search_buffers()
+        self._apply_search()
 
     def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
         """When the load worker finishes, pop the loading screen and show logs."""
@@ -209,12 +270,8 @@ class LogUI(App[None]):
 
         if event.state not in (WorkerState.SUCCESS, WorkerState.ERROR):
             return
-        # Only react to our load worker (result is (entries, raw_lines) on success)
         try:
             if event.state == WorkerState.ERROR:
-                # If we've already painted the initial tail batch, the loading
-                # screen has been popped in _on_initial_batch_from_worker.
-                # Avoid popping again here, which would remove the main app UI.
                 if not self._initial_painted:
                     try:
                         self.pop_screen()
@@ -222,6 +279,7 @@ class LogUI(App[None]):
                         pass
                 self.log_entries = []
                 self.raw_lines = []
+                self._search_buffers = []
                 err = getattr(event.worker, "error", None)
                 msg = str(err) if err else "Failed to parse log file"
                 self.query_one("#log-container", LogContainer).mount(
@@ -235,7 +293,6 @@ class LogUI(App[None]):
             self.log_entries, self.raw_lines = result
         except Exception:
             return
-        # Remove any in-panel loading indicator before showing actual logs.
         try:
             container = self.query_one("#log-container", LogContainer)
             for child in list(container.children):
@@ -246,8 +303,61 @@ class LogUI(App[None]):
         self._loading_rest = False
         if load_used_rust():
             self.notify("Logs loaded with Rust loader", severity="information")
-        self._recompute_filtered_indices()
+        self._rebuild_search_buffers()
+        self._apply_search()
+
+    def _rebuild_search_buffers(self) -> None:
+        """Precompute lowercase search haystacks (JSON + raw) per log index."""
+        buffers: list[str] = []
+        for row in self.log_entries:
+            the_json = row.get("the_json", {})
+            raw = row.get("raw", "")
+            try:
+                json_part = json.dumps(the_json, separators=(",", ":"))
+            except TypeError:
+                json_part = str(the_json)
+            buffers.append(f"{json_part}\n{raw}".lower())
+        self._search_buffers = buffers
+
+    def _apply_search(self) -> None:
+        """Filter rows by case-insensitive substring; rebuild match list for n/N."""
+        n = len(self.log_entries)
+        q = self.search_text.strip().lower()
+
+        if not q:
+            self._filtered_indices = list(range(n))
+            self._search_indices = []
+            self._search_pos = None
+        else:
+            self._filtered_indices = [
+                i for i in range(n) if i < len(self._search_buffers) and q in self._search_buffers[i]
+            ]
+            self._search_indices = list(self._filtered_indices)
+            self._search_pos = 0 if self._search_indices else None
+
         self._populate_log_panel()
+
+        if self._search_indices and self._search_pos is not None:
+            self._focus_log_row(self._search_indices[self._search_pos])
+        self._update_search_current_highlight()
+        self._update_search_status()
+
+    def _row_title(self, row: dict[str, Any], the_json: dict[str, Any]) -> Any:
+        """Build collapsible title; highlight search substring when active."""
+        query = self.search_text if self.search_text.strip() else ""
+        if the_json.get("_parse_error"):
+            raw = the_json.get("_raw", str(the_json))
+            snippet = (raw[:57] + "...") if len(raw) > 60 else raw if raw else "(parse error)"
+            if not query:
+                return snippet
+            t = Text()
+            _append_highlighted_plain(t, snippet, query, "default")
+            return t
+
+        level_val = (row.get("level", "") or "-").strip()
+        msg_val = row.get("message", "") or "-"
+        ts_val = row.get("timestamp", "") or "-"
+        return _build_title_with_search_highlight(self, level_val, msg_val, ts_val, query)
 
     def _update_schema_panel(self, the_json: dict[str, Any] | None) -> None:
         tree = self.query_one("#schema-tree", Tree)
@@ -286,15 +396,7 @@ class LogUI(App[None]):
                 continue
             row = self.log_entries[i]
             the_json = row.get("the_json", {})
-            if the_json.get("_parse_error"):
-                raw = the_json.get("_raw", str(the_json))
-                title: Any = (raw[:57] + "...") if len(raw) > 60 else raw if raw else "(parse error)"
-            else:
-                level_val = (row.get("level", "") or "-").strip()
-                msg_val = row.get("message", "") or "-"
-                ts_val = row.get("timestamp", "") or "-"
-
-                title = _build_title_with_timestamp(self, level_val, msg_val, ts_val)
+            title = self._row_title(row, the_json)
 
             pretty = json.dumps(the_json, indent=2) if isinstance(the_json, dict) else str(the_json)
             children: list[Widget] = [Static(pretty)]
@@ -305,7 +407,6 @@ class LogUI(App[None]):
                 collapsed_symbol="→",
                 expanded_symbol="▼",
             )
-            # Attach logical index without relying on a global ID.
             setattr(collapsible, "log_index", i)
             if i in self.selected_indices:
                 collapsible.add_class("-selected")
@@ -319,10 +420,22 @@ class LogUI(App[None]):
         if collapsibles:
             container.mount(*collapsibles)
 
-        # After repopulating, if there is an active search, try to keep the current hit focused.
-        if self._search_active and self._search_indices and self._search_pos is not None:
-            idx = self._search_indices[self._search_pos]
-            self._focus_log_row(idx)
+    def _update_search_current_highlight(self) -> None:
+        """Ensure only the current n/N match row has -search-current (after focus-only updates)."""
+        try:
+            container = self.query_one("#log-container", LogContainer)
+        except NoMatches:
+            return
+        for row in container.children:
+            if isinstance(row, Collapsible):
+                row.remove_class("-search-current")
+        if self._search_pos is None or not self._search_indices:
+            return
+        idx = self._search_indices[self._search_pos]
+        for row in container.children:
+            if isinstance(row, Collapsible) and getattr(row, "log_index", None) == idx:
+                row.add_class("-search-current")
+                break
 
     def action_focus_schema(self) -> None:
         """Move focus to the schema panel (tree or placeholder)."""
@@ -390,15 +503,36 @@ class LogUI(App[None]):
 
     def on_search_bar_changed(self, message: SearchBar.Changed) -> None:
         """Live-update search when the search bar text changes."""
-        self._on_search_changed(message.value)
+        self.search_text = message.value
+        self._apply_search()
 
     def on_search_bar_submitted(self, message: SearchBar.Submitted) -> None:
-        """Handle Enter from the search bar."""
-        self._on_search_submitted(message.value)
+        """Enter: keep query, hide search bar, return focus to logs."""
+        self.search_text = message.value
+        self._apply_search()
+        self._search_active = False
+        try:
+            search_bar = self.query_one("#search-bar", SearchBar)
+            search_bar.display = False
+        except NoMatches:
+            pass
+        if self._search_indices and self._search_pos is not None:
+            self._focus_log_row(self._search_indices[self._search_pos])
+        else:
+            self.action_focus_log_list()
 
     def on_search_bar_cancelled(self, message: SearchBar.Cancelled) -> None:
-        """Exit search mode on Esc from the search bar."""
-        self._on_search_cancelled()
+        """Esc: clear search, show all rows, hide bar."""
+        self.search_text = ""
+        try:
+            search_bar = self.query_one("#search-bar", SearchBar)
+            search_bar.set_value("")
+            search_bar.display = False
+        except NoMatches:
+            pass
+        self._search_active = False
+        self._apply_search()
+        self.action_focus_log_list()
 
     def action_quit(self) -> None:
         self.exit()
@@ -428,9 +562,13 @@ class LogUI(App[None]):
         search_bar = self.query_one("#search-bar", SearchBar)
         search_bar.display = True
         search_bar.set_value(self.search_text)
+        self.search_text = search_bar.get_value()
         search_bar.focus_input()
-        # Recompute matches for the current text, if any.
-        self._recompute_search_indices()
+        self._apply_search()
+
+    def action_search_escape(self) -> None:
+        """Escape while search bar is open: clear query and close bar."""
+        self.on_search_bar_cancelled(SearchBar.Cancelled())
 
     def action_search_next(self) -> None:
         """Jump to the next search match (n)."""
@@ -441,6 +579,7 @@ class LogUI(App[None]):
         else:
             self._search_pos = (self._search_pos + 1) % len(self._search_indices)
         self._focus_log_row(self._search_indices[self._search_pos])
+        self._update_search_current_highlight()
         self._update_search_status()
 
     def action_search_prev(self) -> None:
@@ -452,39 +591,7 @@ class LogUI(App[None]):
         else:
             self._search_pos = (self._search_pos - 1) % len(self._search_indices)
         self._focus_log_row(self._search_indices[self._search_pos])
-        self._update_search_status()
-
-    def _recompute_search_indices(self) -> None:
-        """Recompute search matches over the current filtered indices."""
-        pattern = self.search_text.strip()
-        self._search_indices = []
-        self._search_pos = None
-
-        if not pattern:
-            self._update_search_status()
-            return
-
-        scored: list[tuple[int, int]] = []
-        for idx in self._filtered_indices:
-            if idx >= len(self.log_entries):
-                continue
-            row = self.log_entries[idx]
-            the_json = row.get("the_json", {})
-            raw = row.get("raw", "")
-            try:
-                json_part = json.dumps(the_json)
-            except TypeError:
-                json_part = str(the_json)
-            candidate = f"{json_part}\n{raw}"
-            score = fuzzy_match(pattern, candidate)
-            if isinstance(score, (int, float)) and score >= 0:
-                scored.append((int(score), idx))
-
-        scored.sort(key=lambda t: (-t[0], t[1]))
-        self._search_indices = [idx for _, idx in scored]
-        if self._search_indices:
-            self._search_pos = 0
-            self._focus_log_row(self._search_indices[0])
+        self._update_search_current_highlight()
         self._update_search_status()
 
     def _update_search_status(self) -> None:
@@ -494,74 +601,11 @@ class LogUI(App[None]):
         except NoMatches:
             return
         total = len(self._search_indices)
-        if total == 0 or self.search_text.strip() == "":
-            status = ""
+        if total == 0 or not self.search_text.strip():
+            search_bar.update_status("")
         else:
             current = (self._search_pos or 0) + 1 if self._search_pos is not None else 1
-            status = f"{current}/{total}"
-        search_bar.update_status(status)
-
-    def _on_search_changed(self, value: str) -> None:
-        """Handle live search text changes from the search bar."""
-        self.search_text = value
-        self._recompute_search_indices()
-
-    def _on_search_submitted(self, value: str) -> None:
-        """Handle Enter from the search bar."""
-        self.search_text = value
-        self._recompute_search_indices()
-
-    def _on_search_cancelled(self) -> None:
-        """Exit search mode and hide the search bar."""
-        self._search_active = False
-        try:
-            search_bar = self.query_one("#search-bar", SearchBar)
-            search_bar.display = False
-        except NoMatches:
-            pass
-
-    def action_filter(self) -> None:
-        self.push_screen(FilterScreen(current=self.filter_text), self._on_filter_done)
-
-    def _on_filter_done(self, filter_text: str | None) -> None:
-        if filter_text is None:
-            return
-        self.filter_text = filter_text
-        self._recompute_filtered_indices()
-        # Filter affects which rows are visible; recompute search matches if needed.
-        if self.search_text.strip():
-            self._recompute_search_indices()
-        self._populate_log_panel()
-        self.notify(f"Filter: {len(self._filtered_indices)} line(s) match")
-
-    @on(FilterScreen.Changed)
-    def _on_filter_changed_live(self, event: FilterScreen.Changed) -> None:
-        """Live-update filtering while the filter dialog is open."""
-        self.filter_text = event.value
-        self._recompute_filtered_indices()
-        self._populate_log_panel()
-        if self.search_text.strip():
-            self._recompute_search_indices()
-
-    def _recompute_filtered_indices(self) -> None:
-        """Recompute which log indices match the current filter text."""
-        if not self.filter_text.strip():
-            self._filtered_indices = list(range(len(self.log_entries)))
-            return
-
-        pattern = self.filter_text
-        indices: list[int] = []
-        for i, row in enumerate(self.log_entries):
-            the_json = row.get("the_json", {})
-            raw = row.get("raw", "")
-            try:
-                json_part = json.dumps(the_json)
-            except TypeError:
-                json_part = str(the_json)
-            candidate = f"{json_part}\n{raw}"
-            if fuzzy_match(pattern, candidate):
-                indices.append(i)
-        self._filtered_indices = indices
+            search_bar.update_status(f"{current}/{total}")
 
 
 if __name__ == "__main__":

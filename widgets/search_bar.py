@@ -66,7 +66,11 @@ class SearchBar(Widget):
     def compose(self) -> ComposeResult:
         with Horizontal():
             yield Static("/", classes="search-prefix")
-            yield Input(placeholder="Search...", classes="search-input", id="search-input")
+            yield Input(
+                placeholder="Substring (like /pattern in Vim)…",
+                classes="search-input",
+                id="search-input",
+            )
             yield Static("", classes="search-status", id="search-status")
 
     def on_mount(self) -> None:
@@ -82,6 +86,10 @@ class SearchBar(Widget):
         inp = self.query_one("#search-input", Input)
         inp.value = value
 
+    def get_value(self) -> str:
+        """Return the current search input text."""
+        return self.query_one("#search-input", Input).value or ""
+
     def update_status(self, status: str) -> None:
         """Update the status label (e.g. '3/12', 'No matches')."""
         self._status = status
@@ -94,8 +102,4 @@ class SearchBar(Widget):
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id == "search-input":
             self.post_message(self.Submitted(event.value or ""))
-
-    def key_escape(self) -> None:
-        # Let Esc cancel search.
-        self.post_message(self.Cancelled())
 
